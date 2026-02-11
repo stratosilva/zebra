@@ -120,6 +120,13 @@ def load_mappings():
     with open(MAPPING_FILE, 'r') as f:
         return json.load(f)["mappingDictionary"]
 
+def check_ou_exists_in_zebra(zebra_api, ou_uid):
+    """Queries target server to verify if the OU exists."""
+    try:
+        response = zebra_api.get(f'organisationUnits/{ou_uid}')
+        return response.status_code == 200
+    except RequestException:
+        return False
 
 def get_program_attributes(api, program_id):
     params = {'fields': 'programTrackedEntityAttributes[trackedEntityAttribute[id]]'}
@@ -195,10 +202,14 @@ def run_sync(period="today"):
             tei_full = eidsr_api.get(f'tracker/trackedEntities/{tei_id}', params=tei_params).json()
 
             allowed_teas = prog_tea_cache[prog_id]
-            mapped_ou = get_mapped_ou(tei_full['orgUnit'], mappings)
+            source_ou = tei_full['orgUnit']
+            mapped_ou = get_mapped_ou(source_ou, mappings)
 
-            if not mapped_ou:
-                print(f"CRITICAL: Skipping TEI {tei_id} - Organisation Unit mapping is missing.")
+            # If not mapped, verify existence on Zebra directly
+            target_ou_to_use = mapped_ou if mapped_ou else source_ou
+
+            if not check_ou_exists_in_zebra(zebra_api, target_ou_to_use):
+                print(f"SKIPPING TEI {tei_id}: OrgUnit '{target_ou_to_use}' not found on Zebra server.")
                 continue
 
             mapped_main_attrs = map_attributes(tei_full.get('attributes', []), mappings, allowed_teas,
