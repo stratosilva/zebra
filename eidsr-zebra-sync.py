@@ -184,7 +184,8 @@ def run_sync(period="today"):
     sync_queue = {}
     now = datetime.utcnow()
     if period == "today":
-        start_date = (now - timedelta(days=1)).strftime('%Y-%m-%d')  # Sync last 24h [cite: 5]
+        start_date = now.strftime('%Y-%m-%d')
+        # Old Logic, if you want to do the Last 24h: start_date = (now - timedelta(days=1)).strftime('%Y-%m-%d')
     elif period == "this_week":
         # Start of current week (Monday)
         start_date = (now - timedelta(days=now.weekday())).strftime('%Y-%m-%d')
