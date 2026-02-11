@@ -183,7 +183,13 @@ def run_sync(period="today"):
 
     sync_queue = {}
     now = datetime.utcnow()
-    start_date = (now - timedelta(days=1)).strftime('%Y-%m-%d') if period == "today" else "1900-01-01"
+    if period == "today":
+        start_date = (now - timedelta(days=1)).strftime('%Y-%m-%d')  # Sync last 24h [cite: 5]
+    elif period == "this_week":
+        # Start of current week (Monday)
+        start_date = (now - timedelta(days=now.weekday())).strftime('%Y-%m-%d')
+    else:
+        start_date = "1900-01-01"  # All time
 
     for prog_id in source_programs:
         print(f"Sync: Processing {prog_id}...")
