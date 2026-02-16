@@ -2,7 +2,8 @@ from __future__ import annotations
 import os
 import json
 import copy
-import argparse  # Added for command-line argument parsing
+import sys
+import argparse
 from datetime import datetime, timedelta
 import pandas as pd
 from dhis2 import Api, RequestException
@@ -10,15 +11,16 @@ from dhis2 import Api, RequestException
 # ----------------------------
 # Constants & Paths
 # ----------------------------
-CONFIG_DIR = "./config" 
+CONFIG_DIR = "./config"
 MAPPING_FILE = os.path.join(CONFIG_DIR, "mappingDictionary.json")
 EIDSR_AUTH = os.path.join(CONFIG_DIR, "eIDSR_auth.json")
 ZEBRA_AUTH = os.path.join(CONFIG_DIR, "zebra_auth.json")
 PAYLOAD_FILE = "zebra_payload.json"
 
-PROG_EBS = "JRuLW57woOB" 
-PROG_IBS = "xDsAFnQMmeU" 
-TE_TYPE_ZEBRA = "QH1LBzGrk5g" 
+PROG_EBS = "JRuLW57woOB"
+PROG_IBS = "xDsAFnQMmeU"
+TE_TYPE_ZEBRA = "QH1LBzGrk5g"
+
 
 # ----------------------------
 # Analytics Logic
@@ -34,9 +36,9 @@ def run_zebra_analytics(zebra_api):
             'skipEvents': 'false'
         })
         print(f"Analytics job started successfully. Status: {response.status_code}")
-        print(f"Server Message: {response.json().get('message', 'Processing...')}")
     except RequestException as e:
         print(f"Warning: Could not trigger analytics job. Code: {e.code}")
+
 
 # ----------------------------
 # Fallback & Response Logic
@@ -51,7 +53,7 @@ def post_individual_teis(zebra_api, tei_list):
         single_payload = {'trackedEntities': [tei]}
         try:
             zebra_api.post('tracker', json=single_payload, params={
-                'importStrategy': 'CREATE_AND_UPDATE', 
+                'importStrategy': 'CREATE_AND_UPDATE',
                 'async': 'false'
             })
             print(f"SUCCESS: TEI {uid} persisted.")
@@ -65,8 +67,9 @@ def post_individual_teis(zebra_api, tei_list):
                 print(f"FAILED: TEI {uid} | Status Code: {e.code}")
     return success_count > 0
 
+
 def post_data_to_zebra(zebra_api, zebra_case_data):
-    """POST payload to Zebra with advanced error analysis and individual fallback Retries."""
+    """POST payload to Zebra with fallback Retries."""
     batch_success = False
     try:
         response = zebra_api.post(
@@ -82,7 +85,7 @@ def post_data_to_zebra(zebra_api, zebra_case_data):
         )
         rj = response.json()
         stats = rj.get('stats', {})
-        print(f"[ZEBRA] Batch Post Successful | created={stats.get('created',0)}, updated={stats.get('updated',0)}")
+        print(f"[ZEBRA] Batch Post Successful | created={stats.get('created', 0)}, updated={stats.get('updated', 0)}")
         batch_success = True
         return rj
 
@@ -90,30 +93,42 @@ def post_data_to_zebra(zebra_api, zebra_case_data):
         print(f"!!! BATCH POST FAILED (HTTP {e.code})")
         try:
             rj = json.loads(e.description)
-            server_msg = rj.get('message', 'No message body found')
-            print(f"SERVER ERROR MESSAGE: {server_msg}")
+            print(f"SERVER ERROR MESSAGE: {rj.get('message', 'Unknown error')}")
         except:
-            print(f"Could not parse error body: {e.description}")
-            rj = {}
+            print(f"Could not parse error body.")
 
         tei_list = zebra_case_data.get('trackedEntities', [])
         if tei_list:
             batch_success = post_individual_teis(zebra_api, tei_list)
-        
         return rj
-    
+
     finally:
         if batch_success:
             run_zebra_analytics(zebra_api)
+
 
 # ----------------------------
 # Core Logic Helpers
 # ----------------------------
 
+def check_auth(api, name):
+    """Checks credentials by accessing system version."""
+    try:
+        # Accessing version triggers system/info fetch
+        _ = api.version
+        return True
+    except RequestException as e:
+        if e.code == 401:
+            print(f"ERROR: Credentials for {name} are not correct (401 Unauthorized).")
+        else:
+            print(f"ERROR: Could not connect to {name} (Code: {e.code}).")
+        return False
+
+
 def load_mappings():
-    """Loads the mapping dictionary."""
     with open(MAPPING_FILE, 'r') as f:
         return json.load(f)["mappingDictionary"]
+
 
 def check_ou_exists_in_zebra(zebra_api, ou_uid):
     """Queries target server to verify if the OU exists."""
@@ -123,42 +138,40 @@ def check_ou_exists_in_zebra(zebra_api, ou_uid):
     except RequestException:
         return False
 
+
 def get_program_attributes(api, program_id):
-    """Identifies which TEAs belong to a specific program."""
     params = {'fields': 'programTrackedEntityAttributes[trackedEntityAttribute[id]]'}
     resp = api.get(f'programs/{program_id}', params=params).json()
     return {a['trackedEntityAttribute']['id'] for a in resp.get('programTrackedEntityAttributes', [])}
 
+
 def get_mapped_ou(source_ou_id, mappings):
-    """Translates eIDSR OrgUnit and extracts the clean 11-char UID."""
     ou_map = mappings.get("organisationUnits", {})
     if source_ou_id in ou_map:
         full_mapped_id = ou_map[source_ou_id]["mappedId"]
         return full_mapped_id.split('/')[-1]
     return None
 
+
 def map_attributes(source_attrs, mappings, allowed_ids=None, log_warnings=False):
-    """Maps attributes using Code-to-Code translation for Option Sets."""
     mapped = []
     tea_map = mappings.get("trackedEntityAttributesToTEI", {})
     raw_options = mappings.get("options", {})
-    code_lookup = {opt["code"]: opt["mappedCode"] for opt in raw_options.values() if "code" in opt and "mappedCode" in opt}
-    
+    code_lookup = {opt["code"]: opt["mappedCode"] for opt in raw_options.values() if
+                   "code" in opt and "mappedCode" in opt}
+
     for attr in source_attrs:
         src_id = attr.get('attribute')
         val = attr.get('value')
-        
-        if allowed_ids and src_id not in allowed_ids: 
-            continue
-            
+        if allowed_ids and src_id not in allowed_ids: continue
         if src_id in tea_map:
             target_id = tea_map[src_id]["mappedId"]
             mapped_val = code_lookup.get(val, val)
             mapped.append({"attribute": target_id, "value": mapped_val})
         elif log_warnings:
             print(f"Warning: TEA ID '{src_id}' is unmapped.")
-            
     return mapped
+
 
 # ----------------------------
 # Main Sync Workflow
@@ -168,51 +181,51 @@ def run_sync(period="today"):
     mappings = load_mappings()
     eidsr_api = Api.from_auth_file(EIDSR_AUTH)
     zebra_api = Api.from_auth_file(ZEBRA_AUTH)
-    
+
+    # Check credentials for both servers
+    if not check_auth(eidsr_api, "eIDSR") or not check_auth(zebra_api, "Zebra"):
+        sys.exit(1)
+
     source_programs = [PROG_EBS, PROG_IBS]
     prog_tea_cache = {pid: get_program_attributes(eidsr_api, pid) for pid in source_programs}
-    
-    sync_queue = {} 
+
+    sync_queue = {}
     now = datetime.utcnow()
 
-    # Time periods logic based on CLI parameter
     if period == "today":
-        start_date = now.strftime('%Y-%m-%d') # Strictly current calendar date
-        # Previous Logic (Last 24h): start_date = (now - timedelta(days=1)).strftime('%Y-%m-%d')
+        start_date = now.strftime('%Y-%m-%d')
     elif period == "this_week":
-        start_date = (now - timedelta(days=now.weekday())).strftime('%Y-%m-%d') # Monday of current week
+        start_date = (now - timedelta(days=now.weekday())).strftime('%Y-%m-%d')
     else:
-        start_date = "1900-01-01" # All time
+        start_date = "1900-01-01"
 
     for prog_id in source_programs:
-        print(f"Sync: Processing {prog_id} for period '{period}' (Enrolled After: {start_date})...")
+        print(f"Sync: Processing {prog_id}...")
         params = {'program': prog_id, 'ouMode': 'ALL', 'enrolledAfter': start_date}
-        
+
         resp = eidsr_api.get('tracker/enrollments', params=params).json()
         instances = resp.get('instances', resp.get('enrollments', []))
         target_prog_id = mappings["trackerPrograms"][prog_id]["mappedId"]
 
         for enr in instances:
             tei_id = enr['trackedEntity']
-            if tei_id in sync_queue and prog_id == PROG_EBS: 
-                continue 
-            
-            tei_full = eidsr_api.get(f'tracker/trackedEntities/{tei_id}', 
-                                    params={'fields': 'trackedEntity,orgUnit,attributes,enrollments[program,enrolledAt,attributes]'}).json()
-            
+            if tei_id in sync_queue and prog_id == PROG_EBS: continue
+
+            tei_params = {'fields': 'trackedEntity,orgUnit,attributes,enrollments[program,enrolledAt,attributes]'}
+            tei_full = eidsr_api.get(f'tracker/trackedEntities/{tei_id}', params=tei_params).json()
+
             allowed_teas = prog_tea_cache[prog_id]
             source_ou = tei_full['orgUnit']
             mapped_ou = get_mapped_ou(source_ou, mappings)
-            
-            # Verify OU existence on target server before building payload
             target_ou_to_use = mapped_ou if mapped_ou else source_ou
-            
+
             if not check_ou_exists_in_zebra(zebra_api, target_ou_to_use):
-                print(f"SKIPPING TEI {tei_id}: OrgUnit '{target_ou_to_use}' does not exist on Zebra server.")
+                print(f"SKIPPING TEI {tei_id}: OrgUnit '{target_ou_to_use}' not found on Zebra.")
                 continue
 
-            mapped_main_attrs = map_attributes(tei_full.get('attributes', []), mappings, allowed_teas, log_warnings=True)
-            
+            mapped_main_attrs = map_attributes(tei_full.get('attributes', []), mappings, allowed_teas,
+                                               log_warnings=True)
+
             target_enr_list = []
             for source_enr in tei_full.get('enrollments', []):
                 if source_enr['program'] == prog_id:
@@ -223,7 +236,7 @@ def run_sync(period="today"):
                         }).json()
                         z_check = z_check_resp.get('instances', z_check_resp.get('enrollments', []))
                         z_enr_id = z_check[0]['enrollment'] if z_check else None
-                    except: 
+                    except:
                         pass
 
                     target_enr_list.append({
@@ -232,7 +245,8 @@ def run_sync(period="today"):
                         "orgUnit": target_ou_to_use,
                         "status": "ACTIVE",
                         "enrolledAt": source_enr['enrolledAt'],
-                        "attributes": map_attributes(source_enr.get('attributes', []), mappings, allowed_teas, log_warnings=False)
+                        "attributes": map_attributes(source_enr.get('attributes', []), mappings, allowed_teas,
+                                                     log_warnings=False)
                     })
 
             sync_queue[tei_id] = {
@@ -248,20 +262,13 @@ def run_sync(period="today"):
         payload = {'trackedEntities': list(sync_queue.values())}
         with open(PAYLOAD_FILE, 'w') as f:
             json.dump(payload, f, indent=4)
-        print(f"Payload generated ({len(payload['trackedEntities'])} records). Posting...")
         post_data_to_zebra(zebra_api, payload)
     else:
-        print("No new data found to synchronize.")
+        print("No new data.")
+
 
 if __name__ == "__main__":
-    # Command-line interface setup
-    parser = argparse.ArgumentParser(description="eIDSR to Zebra Intelligent Middleware")
-    parser.add_argument(
-        "-p", "--period", 
-        choices=["today", "this_week", "all_time"], 
-        default="today",
-        help="Select the time period for synchronization (default: today)"
-    )
-    
+    parser = argparse.ArgumentParser(description="eIDSR to Zebra Sync")
+    parser.add_argument("-p", "--period", choices=["today", "this_week", "all_time"], default="today")
     args = parser.parse_args()
     run_sync(period=args.period)
