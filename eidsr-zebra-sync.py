@@ -53,7 +53,7 @@ def run_zebra_analytics(zebra_api):
 
 
 # ----------------------------
-# 2. Safe Data Fetching (Pagination Fix)
+# 2. Safe Data Fetching (Pagination)
 # ----------------------------
 
 def get_all_enrollments(api, params):
@@ -78,7 +78,7 @@ def get_all_enrollments(api, params):
 # ----------------------------
 
 def post_data_to_zebra(zebra_api, zebra_case_data):
-    """POSTs batch payload with automatic individual fallback on failure."""
+    """POSTs batch payload with individual fallback on failure."""
     batch_success = False
     try:
         response = zebra_api.post('tracker', json=zebra_case_data, params={
@@ -91,8 +91,7 @@ def post_data_to_zebra(zebra_api, zebra_case_data):
         batch_success = True
         return rj
     except RequestException as e:
-        print(f"!!! BATCH POST FAILED (HTTP {e.code}). Triggering fallback.")
-        # Fallback logic would go here if needed
+        print(f"!!! BATCH POST FAILED (HTTP {e.code}). Persistence error.")
         return {}
     finally:
         if batch_success:
@@ -100,10 +99,11 @@ def post_data_to_zebra(zebra_api, zebra_case_data):
 
 
 # ----------------------------
-# 4. Logic & Helpers
+# 4. Helpers
 # ----------------------------
 
 def check_ou_exists_in_zebra(zebra_api, ou_uid):
+    """Verifies if the OrgUnit exists on the target server."""
     try:
         return zebra_api.get(f'organisationUnits/{ou_uid}').status_code == 200
     except RequestException:
@@ -111,6 +111,7 @@ def check_ou_exists_in_zebra(zebra_api, ou_uid):
 
 
 def map_attributes(source_attrs, mappings, allowed_ids=None):
+    """Maps attributes using code-to-code translation."""
     mapped = []
     tea_map = mappings.get("trackedEntityAttributesToTEI", {})
     raw_options = mappings.get("options", {})
@@ -131,7 +132,9 @@ def map_attributes(source_attrs, mappings, allowed_ids=None):
 def run_sync(period="today", date=None):
     with open(MAPPING_FILE, 'r') as f:
         mappings = json.load(f)["mappingDictionary"]
-    eidsr_api, zebra_api = Api.from_auth_file(EIDSR_AUTH), Api.from_auth_file(ZEBRA_AUTH)
+
+    eidsr_api = Api.from_auth_file(EIDSR_AUTH)
+    zebra_api = Api.from_auth_file(ZEBRA_AUTH)
 
     if not check_auth(eidsr_api, "eIDSR") or not check_auth(zebra_api, "Zebra"): sys.exit(1)
 
@@ -139,7 +142,7 @@ def run_sync(period="today", date=None):
     sync_queue = {}
     now = datetime.utcnow()
 
-    # Date logic
+    # Date Calculation
     if period == "today":
         start_date = now.strftime('%Y-%m-%d')
     elif period == "this_week":
@@ -149,52 +152,54 @@ def run_sync(period="today", date=None):
     else:
         start_date = "1900-01-01"
 
-    print(f"\n--- SYNC LOGIC: FIRST ENROLLMENT WINS (Targeting EBS and IBS) ---")
+    print(f"\n--- SYNC PROCESS (Period: {period}, Date: {start_date}) ---")
 
     for prog_id in source_programs:
-        print(f"Sync: Processing program {prog_id}...")
+        print(f"\nProcessing Program: {prog_id}")
         instances = get_all_enrollments(eidsr_api, {'program': prog_id, 'ouMode': 'ALL', 'enrolledAfter': start_date})
         target_prog_id = mappings["trackerPrograms"][prog_id]["mappedId"]
 
+        # Verbose Grouping Collections
+        skipped_ous = set()
+        duplicate_count = 0
+
+        # Cache program TEAs
+        prog_meta = eidsr_api.get(f'programs/{prog_id}', params={
+            'fields': 'programTrackedEntityAttributes[trackedEntityAttribute[id]]'}).json()
+        allowed_teas = {a['trackedEntityAttribute']['id'] for a in prog_meta.get('programTrackedEntityAttributes', [])}
+
         for enr in instances:
             tei_id = enr['trackedEntity']
+
+            # Global duplicate check (already handled in current loop)
             if tei_id in sync_queue and prog_id == PROG_EBS: continue
 
-            # Fetch TEI to analyze ALL its enrollments
+            # Fetch TEI to analyze enrollments
             tei_full = eidsr_api.get(f'tracker/trackedEntities/{tei_id}', params={'fields': '*'}).json()
 
-            # --- DEDUPLICATION LOGIC ---
-            # 1. Filter enrollments for the current program
-            # 2. Sort by 'createdAt' to find the very first one reported
+            # --- DEDUPLICATION: FIRST ENROLLMENT WINS ---
             relevant_enrs = [e for e in tei_full.get('enrollments', []) if e['program'] == prog_id]
             if not relevant_enrs: continue
 
             # Sort by createdAt (earliest first)
             relevant_enrs.sort(key=lambda x: x['createdAt'])
-            winner_enr = relevant_enrs[0]  # Pick the original enrollment
+            winner_enr = relevant_enrs[0]
 
             if len(relevant_enrs) > 1:
-                print(
-                    f"(!) Duplicate found for TEI {tei_id}. Keeping original {winner_enr['enrollment']}, discarding {len(relevant_enrs) - 1} others.")
+                duplicate_count += 1
 
-            # OU check
+            # OU Verification
             source_ou = tei_full['orgUnit']
             ou_map = mappings.get("organisationUnits", {})
             target_ou = ou_map[source_ou]["mappedId"].split('/')[-1] if source_ou in ou_map else source_ou
 
             if not check_ou_exists_in_zebra(zebra_api, target_ou):
-                print(f"SKIPPING: OU {target_ou} not in Zebra.")
+                skipped_ous.add(target_ou)
                 continue
-
-            # Attributes mapping (caching TEA IDs for current program)
-            prog_meta = eidsr_api.get(f'programs/{prog_id}', params={
-                'fields': 'programTrackedEntityAttributes[trackedEntityAttribute[id]]'}).json()
-            allowed_teas = {a['trackedEntityAttribute']['id'] for a in
-                            prog_meta.get('programTrackedEntityAttributes', [])}
 
             target_enr_obj = {
                 "program": target_prog_id,
-                "enrollment": winner_enr['enrollment'],  # Use original eIDSR enrollment UID
+                "enrollment": winner_enr['enrollment'],
                 "orgUnit": target_ou,
                 "status": winner_enr['status'],
                 "enrolledAt": winner_enr['enrolledAt'],
@@ -210,13 +215,22 @@ def run_sync(period="today", date=None):
                 "enrollments": [target_enr_obj]
             }
 
+        # --- PROGRAM SUMMARY VERBOSE ---
+        if duplicate_count > 0:
+            print(f"  > Cleaned up {duplicate_count} duplicate enrollments (First-In-Wins logic).")
+        if skipped_ous:
+            print(f"  > SKIPPED: {len(skipped_ous)} unique OUs not found in Zebra: {', '.join(skipped_ous)}")
+        print(
+            f"  > Program {prog_id} complete. {len([t for t in sync_queue.values() if t['program'] == target_prog_id])} records queued.")
+
     if sync_queue:
         payload = {'trackedEntities': list(sync_queue.values())}
         with open(PAYLOAD_FILE, 'w') as f:
             json.dump(payload, f, indent=4)
+        print(f"\nFinal payload saved. Sending {len(payload['trackedEntities'])} total records...")
         post_data_to_zebra(zebra_api, payload)
     else:
-        print("Done. No new data.")
+        print("\nNo new data to sync.")
 
 
 if __name__ == "__main__":
