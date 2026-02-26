@@ -209,7 +209,7 @@ def map_attributes(source_attrs, mappings, allowed_ids=None, log_warnings=False)
 # 5. Main Sync Workflow
 # ----------------------------
 
-def run_sync(period="today"):
+def run_sync(period="today", date=None):
     mappings = load_mappings()
     eidsr_api = Api.from_auth_file(EIDSR_AUTH)
     zebra_api = Api.from_auth_file(ZEBRA_AUTH)
@@ -221,14 +221,24 @@ def run_sync(period="today"):
     source_programs = [PROG_EBS, PROG_IBS]
     sync_queue = {}
     now = datetime.utcnow()
-
+    
+  
     # 2. Logic for today / this week / all time
     if period == "today":
         start_date = now.strftime('%Y-%m-%d')
     elif period == "this_week":
         start_date = (now - timedelta(days=now.weekday())).strftime('%Y-%m-%d')
+    elif period == "custom":
+        try:
+            datetime.strptime(date, '%Y-%m-%d')
+            start_date = date
+        except ValueError:
+            print("ERROR: Invalid date format for custom period. Use YYYY-MM-DD.")
+            sys.exit(2)
     else:
         start_date = "1900-01-01"
+
+    print(f"\n--- STARTING SYNC PROCESS (Period: {period}, Date: {date}) ---")
 
     for prog_id in source_programs:
         print(f"Sync: Fetching data for {prog_id} (After: {start_date})...")
@@ -305,7 +315,9 @@ def run_sync(period="today"):
 
 if __name__ == "__main__":
     # 5. CLI Parameter Implementation
+    #
     parser = argparse.ArgumentParser(description="eIDSR to Zebra Sync")
-    parser.add_argument("-p", "--period", choices=["today", "this_week", "all_time"], default="today")
+    parser.add_argument("-p", "--period", choices=["today", "this_week", "all_time", "custom"], default="today")
+    parser.add_argument("-d", "--date")
     args = parser.parse_args()
-    run_sync(period=args.period)
+    run_sync(period=args.period, date=args.date)
